@@ -108,6 +108,7 @@ def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
+            cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS image_url TEXT;")
         conn.commit()
     print("[DB] All tables ready.")
 
@@ -129,12 +130,13 @@ def save_listing(data):
     data.setdefault('description','')
     data.setdefault('city','toronto')
     data.setdefault('images',[])
+    data.setdefault('image_url','')
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO listings
-                (platform,external_id,url,title,description,price_cad,city,images,status)
+                (platform,external_id,url,title,description,price_cad,city,images,image_url,status)
                 VALUES (%(platform)s,%(external_id)s,%(url)s,%(title)s,%(description)s,
-                %(price_cad)s,%(city)s,%(images)s,%(status)s)
+                %(price_cad)s,%(city)s,%(images)s,%(image_url)s,%(status)s)
                 ON CONFLICT (external_id) DO NOTHING""", data)
         conn.commit()
 

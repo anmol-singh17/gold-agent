@@ -67,100 +67,122 @@ def _safe_get(url, timeout=12, retries=2):
                 raise
     return None
 
-# ── KIJIJI ────────────────────────────────────────────────────────────────────
-def fetch_kijiji_detail(url):
-    try:
-        resp = _safe_get(url)
-        soup = BeautifulSoup(resp.text,'html.parser')
-        desc_el = soup.select_one('[class*="descriptionContainer"]') or soup.select_one('[itemprop="description"]')
-        desc = desc_el.get_text(strip=True)[:1000] if desc_el else ""
-        imgs = []
-        for img in soup.select('img[src*="kijiji"]')[:5]:
-            src = img.get('src','')
-            if src and 'placeholder' not in src and src.startswith('http'):
-                imgs.append(src)
-        return desc, imgs
-    except Exception as e:
-        return "", []
-
 def run_kijiji_scrape():
-    # Try Scrapling first (stealth), fall back to requests
-    try:
-        from scrapling.fetchers import StealthyFetcher
-        fetcher = StealthyFetcher()
-        use_scrapling = True
-        db.log_agent_event("scrape","Kijiji: using Scrapling stealth fetcher")
-    except ImportError:
-        use_scrapling = False
-        db.log_agent_event("scrape","Kijiji: Scrapling not available, using requests fallback")
-
+    from playwright.sync_api import sync_playwright
     total_new = 0
-    for s in KIJIJI_SEARCHES:
-        try:
-            url = f"https://www.kijiji.ca/b-buy-sell/toronto/{s}/k0c0l1700273"
-            try:
-                if use_scrapling:
-                    page = fetcher.fetch(url)
-                    html = page.html
-                else:
-                    html = _safe_get(url).text
-            except Exception as e:
-                db.log_agent_event("scrape", f"Kijiji fetch failed '{s}', trying requests fallback: {e}", level="warn")
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
+            
+            for s in KIJIJI_SEARCHES:
                 try:
-                    html = _safe_get(url).text
-                except Exception as e2:
-                    db.log_agent_event("scrape", f"Kijiji both methods failed '{s}': {e2}", level="error")
-                    continue
+                    results = []
+                    url = f"https://www.kijiji.ca/b-buy-sell/toronto/{s}/k0c0l1700273"
+                    page = browser.new_page()
+                    
+                    captured = []
+                    def handle_response(response):
+                        if 'api/2.0/ads' in response.url or 'srp-api' in response.url:
+                            try:
+                                data = response.json()
+                                captured.append(data)
+                            except:
+                                pass
+                    
+                    page.on('response', handle_response)
+                    try:
+                        page.goto(url, wait_until='networkidle', timeout=30000)
+                    except Exception as e:
+                        db.log_agent_event("scrape", f"Kijiji load timeout for {s}: {e}", level="warn")
+                    page.wait_for_timeout(3000)
+                    
+                    # Parse captured API responses
+                    for data in captured:
+                        ads = data.get('ads', data.get('data', {}).get('ads', []))
+                        for ad in ads:
+                            try:
+                                results.append({
+                                    'title': ad.get('title', ''),
+                                    'price': float(ad.get('price', {}).get('amount', 0)) / 100.0,
+                                    'url': 'https://www.kijiji.ca' + ad.get('seoUrl', ''),
+                                    'description': ad.get('description', ''),
+                                    'image_url': ad.get('images', [{}])[0].get('uri', '') if ad.get('images') else ''
+                                })
+                            except:
+                                continue
+                    
+                    # Fallback: parse rendered HTML if API not captured
+                    if not results:
+                        html = page.content()
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(html, 'html.parser')
+                        for card in soup.select('li[data-listing-id], div[data-listing-id], ul[class*="results"] li, div[data-ad-id]'):
+                            title_el = card.select_one('a[class*="title"], h3 a, a[href*="/v-"] h3, a[data-ad-id] > h3')
+                            price_el = card.select_one('[class*="price"], [data-testid="listing-price"]')
+                            img_el = card.select_one('img')
+                            link_el = card.select_one('a[href*="/v-"]') or card.select_one('a[data-ad-id]')
+                            if title_el and link_el:
+                                try:
+                                    price_text = price_el.get_text(strip=True) if price_el else ''
+                                    href = link_el.get('href', '')
+                                    if not href.startswith('http'): href = 'https://www.kijiji.ca' + href
+                                    results.append({
+                                        'title': title_el.get_text(strip=True),
+                                        'price': extract_price(price_text),
+                                        'url': href,
+                                        'description': '',
+                                        'image_url': img_el.get('src', '') if img_el else ''
+                                    })
+                                except:
+                                    continue
+                    
+                    page.close()
 
-            soup = BeautifulSoup(html,'html.parser')
-            cards = soup.select('ul[class*="results"] li') or soup.select('div[data-ad-id]')
-
-            if not cards:
-                db.log_agent_event("scrape", f"Kijiji '{s}': no cards found — selectors may need update", level="warn")
-                continue
-
-            new = 0
-            for card in cards[:40]:
-                try:
-                    title_el = card.select_one('a[href*="/v-"] h3') or card.select_one('h3')
-                    link_el  = card.select_one('a[href*="/v-"]')
-                    price_el = card.select_one('[data-testid="listing-price"]') or card.select_one('[class*="price"]')
-                    if not title_el or not link_el: continue
-                    title = title_el.get_text(strip=True)
-                    href  = link_el.get('href','')
-                    if not href.startswith('http'): href = 'https://www.kijiji.ca' + href
-                    ext_id = f"kijiji_{href.split('/')[-1]}"
-                    price  = extract_price(price_el.get_text() if price_el else '')
-
-                    # Pre-filter (fast, no API)
-                    ok, reason = pre_filter(title, price)
-                    if not ok: continue
-
-                    # Price drop detection
-                    existing = db.get_listing_price(ext_id)
-                    if existing:
-                        old_price, lid = existing
-                        if price and old_price and price < old_price * 0.95:
-                            db.update_listing_price(lid, price, old_price)
-                            db.log_agent_event("scrape", f"Price drop: '{title[:35]}' ${old_price:.0f}→${price:.0f}")
+                    if not results:
+                        db.log_agent_event("scrape", f"Kijiji '{s}': no cards found via API or HTML", level="warn")
                         continue
 
-                    # Cross-platform dedup
-                    if db.get_duplicate_check(title, price): continue
+                    new = 0
+                    for item in results[:40]:
+                        try:
+                            title = item['title']
+                            href = item['url']
+                            price = item['price']
+                            ext_id = f"kijiji_{href.split('/')[-1]}"
+                            
+                            ok, reason = pre_filter(title, price)
+                            if not ok: continue
 
-                    # Fetch detail page
-                    desc, imgs = fetch_kijiji_detail(href)
-                    db.save_listing({'platform':'kijiji','external_id':ext_id,'url':href,
-                        'title':title,'description':desc,'price_cad':price,
-                        'city':'toronto','images':imgs,'status':'new'})
-                    new += 1
-                except: continue
+                            existing = db.get_listing_price(ext_id)
+                            if existing:
+                                old_price, lid = existing
+                                if price and old_price and price < old_price * 0.95:
+                                    db.update_listing_price(lid, price, old_price)
+                                    db.log_agent_event("scrape", f"Price drop: '{title[:35]}' ${old_price:.0f}→${price:.0f}")
+                                continue
 
-            total_new += new
-            db.log_agent_event("scrape", f"Kijiji '{s}': {new} new listings")
-        except Exception as e:
-            db.log_agent_event("scrape", f"Kijiji search error '{s}': {e}", level="error")
-        time.sleep(2)  # polite delay between keyword requests
+                            if db.get_duplicate_check(title, price): continue
+
+                            db.save_listing({
+                                'platform': 'kijiji', 'external_id': ext_id, 'url': href,
+                                'title': title, 'description': item['description'], 'price_cad': price,
+                                'city': 'toronto', 'images': [], 'image_url': item['image_url'], 'status': 'new'
+                            })
+                            new += 1
+                        except:
+                            continue
+
+                    total_new += new
+                    db.log_agent_event("scrape", f"Kijiji '{s}': {new} new listings")
+                    time.sleep(2)
+
+                except Exception as e:
+                    db.log_agent_event("scrape", f"Kijiji search error '{s}': {e}", level="error")
+
+            browser.close()
+    except Exception as e:
+        db.log_agent_event("scrape", f"Kijiji Playwright error: {e}", level="error")
 
     return total_new
 
