@@ -248,7 +248,9 @@ if __name__ == "__main__":
     send_alert_telegram("🟢 Gold Agent started! All systems go.")
     print("[MAIN] Running. Ctrl+C to stop.")
     try:
-        asyncio.get_event_loop().run_forever()
+        import time
+        while True:
+            time.sleep(60)
     except (KeyboardInterrupt,SystemExit):
         scheduler.shutdown()
         db.log_agent_event("main","Agent stopped by user")
