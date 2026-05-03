@@ -1,0 +1,42 @@
+# Environment
+.env
+*.env
+
+# Browser sessions — NEVER commit these, they contain your login cookies
+sessions/
+sessions/*.json
+sessions/*.txt
+
+# Python
+__pycache__/
+pycache/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Playwright
+.playwright/
+.playwright
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/

@@ -1,0 +1,10 @@
+[build]
+builder = "DOCKERFILE"
+
+[[services]]
+name = "agent-worker"
+startCommand = "python agent/main.py"
+
+[[services]]
+name = "dashboard"
+startCommand = "streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0"
