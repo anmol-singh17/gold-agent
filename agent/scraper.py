@@ -114,7 +114,8 @@ def run_kijiji_scrape():
                     continue
 
             soup = BeautifulSoup(html,'html.parser')
-            cards = (soup.select('[data-testid="listing-card-list-item"]') or
+            cards = (soup.select('div[data-ad-id]') or
+                     soup.select('[data-testid="listing-card-list-item"]') or
                      soup.select('.search-item') or
                      soup.select('[class*="listing"]'))
 
@@ -125,9 +126,9 @@ def run_kijiji_scrape():
             new = 0
             for card in cards[:40]:
                 try:
-                    title_el = card.select_one('[class*="title"]')
-                    link_el  = card.select_one('a[href*="/v-"]')
-                    price_el = card.select_one('[class*="price"]')
+                    title_el = card.select_one('a[data-ad-id] > h3') or card.select_one('[class*="title"]')
+                    link_el  = card.select_one('a[data-ad-id]') or card.select_one('a[href*="/v-"]')
+                    price_el = card.select_one('span[data-ad-id] .price') or card.select_one('[class*="price"]')
                     if not title_el or not link_el: continue
                     title = title_el.get_text(strip=True)
                     href  = link_el.get('href','')
