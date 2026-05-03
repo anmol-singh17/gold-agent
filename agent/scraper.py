@@ -22,13 +22,12 @@ HEADERS = {
     'Sec-Fetch-Site': 'cross-site',
 }
 KIJIJI_SEARCHES = [
-    {"kw":"gold-jewellery","cat":"c689","city":"l1700273"},
-    {"kw":"18k-gold",      "cat":"c689","city":"l1700273"},
-    {"kw":"14k-gold-ring", "cat":"c689","city":"l1700273"},
-    {"kw":"gold-chain",    "cat":"c689","city":"l1700273"},
-    {"kw":"gold-bracelet", "cat":"c689","city":"l1700273"},
-    {"kw":"gold-pendant",  "cat":"c689","city":"l1700273"},
-    {"kw":"22k-gold",      "cat":"c689","city":"l1700273"},
+    "18k-gold-ring",
+    "14k-gold-ring",
+    "gold-chain-toronto",
+    "gold-bracelet-toronto",
+    "22k-gold-jewellery",
+    "gold-pendant-toronto",
 ]
 CL_RSS = [
     "https://toronto.craigslist.org/search/jwa?query=gold+ring&format=rss",
@@ -98,7 +97,7 @@ def run_kijiji_scrape():
     total_new = 0
     for s in KIJIJI_SEARCHES:
         try:
-            url = f"https://www.kijiji.ca/b-{s['kw']}/toronto/{s['cat']}{s['city']}"
+            url = f"https://www.kijiji.ca/b-buy-sell/toronto/{s}/k0c0l1700273"
             try:
                 if use_scrapling:
                     page = fetcher.fetch(url)
@@ -106,29 +105,26 @@ def run_kijiji_scrape():
                 else:
                     html = _safe_get(url).text
             except Exception as e:
-                db.log_agent_event("scrape", f"Kijiji fetch failed '{s['kw']}', trying requests fallback: {e}", level="warn")
+                db.log_agent_event("scrape", f"Kijiji fetch failed '{s}', trying requests fallback: {e}", level="warn")
                 try:
                     html = _safe_get(url).text
                 except Exception as e2:
-                    db.log_agent_event("scrape", f"Kijiji both methods failed '{s['kw']}': {e2}", level="error")
+                    db.log_agent_event("scrape", f"Kijiji both methods failed '{s}': {e2}", level="error")
                     continue
 
             soup = BeautifulSoup(html,'html.parser')
-            cards = (soup.select('div[data-ad-id]') or
-                     soup.select('[data-testid="listing-card-list-item"]') or
-                     soup.select('.search-item') or
-                     soup.select('[class*="listing"]'))
+            cards = soup.select('ul[class*="results"] li') or soup.select('div[data-ad-id]')
 
             if not cards:
-                db.log_agent_event("scrape", f"Kijiji '{s['kw']}': no cards found — selectors may need update", level="warn")
+                db.log_agent_event("scrape", f"Kijiji '{s}': no cards found — selectors may need update", level="warn")
                 continue
 
             new = 0
             for card in cards[:40]:
                 try:
-                    title_el = card.select_one('a[data-ad-id] > h3') or card.select_one('[class*="title"]')
-                    link_el  = card.select_one('a[data-ad-id]') or card.select_one('a[href*="/v-"]')
-                    price_el = card.select_one('span[data-ad-id] .price') or card.select_one('[class*="price"]')
+                    title_el = card.select_one('a[href*="/v-"] h3') or card.select_one('h3')
+                    link_el  = card.select_one('a[href*="/v-"]')
+                    price_el = card.select_one('[data-testid="listing-price"]') or card.select_one('[class*="price"]')
                     if not title_el or not link_el: continue
                     title = title_el.get_text(strip=True)
                     href  = link_el.get('href','')
@@ -161,9 +157,9 @@ def run_kijiji_scrape():
                 except: continue
 
             total_new += new
-            db.log_agent_event("scrape", f"Kijiji '{s['kw']}': {new} new listings")
+            db.log_agent_event("scrape", f"Kijiji '{s}': {new} new listings")
         except Exception as e:
-            db.log_agent_event("scrape", f"Kijiji search error '{s['kw']}': {e}", level="error")
+            db.log_agent_event("scrape", f"Kijiji search error '{s}': {e}", level="error")
         time.sleep(2)  # polite delay between keyword requests
 
     return total_new
