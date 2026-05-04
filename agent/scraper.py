@@ -1,362 +1,263 @@
 """
-scraper.py — 4 platforms: Kijiji, Craigslist, Facebook, eBay Canada
-Full fallback chains, price drop detection, cross-platform dedup, pre-filter before Gemini
+scraper.py — Apify scraping. Input schema from official Apify code sample.
+
+Kijiji:     automation-lab/kijiji-scraper (actor ID: V5XnYsUNkjXYrFvbc)
+            Input: startUrls, searchQuery, category, location, maxListings, includeDetails
+
+Craigslist: automation-lab/craigslist-scraper
+            Input: searchQueries (array), city, category, maxResults, includeDetails
+
+eBay:       Official Browse API — free, no Apify cost.
 """
-import os, re, json, asyncio, time, requests, feedparser
-from bs4 import BeautifulSoup
+import os, re, time, requests
 from dotenv import load_dotenv
 import db
+
 load_dotenv()
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-CA,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Referer': 'https://www.google.com/',
-    'DNT': '1',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'cross-site',
-}
-KIJIJI_SEARCHES = [
-    "18k-gold-ring",
-    "14k-gold-ring",
-    "gold-chain-toronto",
-    "gold-bracelet-toronto",
-    "22k-gold-jewellery",
-    "gold-pendant-toronto",
+APIFY_API_KEY = os.getenv("APIFY_API_KEY", "")
+APIFY_BASE    = "https://api.apify.com/v2"
+SCRAPE_LIMIT  = int(os.getenv("SCRAPE_LIMIT", "15"))
+
+# Kijiji jewelry & watches category URLs for Toronto
+# c133 = Jewelry & Watches, l1700273 = City of Toronto
+KIJIJI_SEARCH_URLS = [
+    "https://www.kijiji.ca/b-jewelry-watch/city-of-toronto/gold-ring/k0c133l1700273",
+    "https://www.kijiji.ca/b-jewelry-watch/city-of-toronto/gold-chain/k0c133l1700273",
+    "https://www.kijiji.ca/b-jewelry-watch/city-of-toronto/gold-bracelet/k0c133l1700273",
+    "https://www.kijiji.ca/b-jewelry-watch/city-of-toronto/gold-pendant/k0c133l1700273",
+    "https://www.kijiji.ca/b-buy-sell/city-of-toronto/22k-gold/k0c0l1700273",
 ]
-CL_RSS = [
-    "https://toronto.craigslist.org/search/jwa?query=gold+ring&format=rss",
-    "https://toronto.craigslist.org/search/jwa?query=18k+gold+chain&format=rss",
-    "https://toronto.craigslist.org/search/jwa?query=14k+gold&format=rss",
-    "https://toronto.craigslist.org/search/jwa?query=gold+bracelet&format=rss",
-    "https://toronto.craigslist.org/search/jwa?query=gold+pendant&format=rss",
+
+CL_KEYWORDS = ["18k gold ring", "14k gold chain", "gold bracelet", "gold pendant"]
+
+EXCLUDE_HARD = [
+    "silver","plated","filled","gold tone","costume","fashion","stainless",
+    "brass","vermeil","rolled gold","gold color","gold colour","fake","replica",
 ]
-FB_KEYWORDS = ["18k gold ring","gold chain selling","14k gold jewelry","gold bracelet","22k gold","gold pendant"]
-EBAY_KEYWORDS = ["18k gold ring","14k gold chain","gold bracelet","gold pendant 18k","22k gold jewelry"]
-EXCLUDE_HARD = ["silver","plated","filled","gold tone","costume","fashion","stainless","brass","vermeil","rolled gold","gold color","gold colour","fake","replica"]
 EXCLUDE_PRICE_MIN = 25.0
 
 def pre_filter(title, price, description=""):
-    """Fast pre-filter BEFORE any Gemini API call. Saves 30-40% on API costs."""
-    text = (title+" "+(description or "")).lower()
+    text = (title + " " + (description or "")).lower()
     if any(k in text for k in EXCLUDE_HARD):
-        return False, f"excluded keyword in '{title[:30]}'"
+        return False, "excluded keyword"
     if price and price < EXCLUDE_PRICE_MIN:
-        return False, f"price ${price} below minimum ${EXCLUDE_PRICE_MIN}"
+        return False, f"price ${price} too low"
     return True, "ok"
 
-def extract_price(text):
-    m = re.search(r'\$[\d,]+', str(text))
-    return float(m.group().replace('$','').replace(',','')) if m else 0.0
+def _parse_price(raw):
+    if raw is None: return 0.0
+    if isinstance(raw, (int, float)): return float(raw)
+    cleaned = re.sub(r"[^\d.]", "", str(raw))
+    return float(cleaned) if cleaned else 0.0
 
-def _safe_get(url, timeout=12, retries=2):
-    """HTTP GET with retries and polite delay."""
-    for attempt in range(retries):
-        try:
-            time.sleep(1.0 + attempt * 0.5)
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
-            resp.raise_for_status()
-            return resp
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-    return None
+def _apify_run(actor_id, run_input, timeout_secs=240):
+    if not APIFY_API_KEY:
+        db.log_agent_event("scrape", "APIFY_API_KEY not set", level="error")
+        return []
+    url    = f"{APIFY_BASE}/acts/{actor_id}/run-sync-get-dataset-items"
+    params = {"token": APIFY_API_KEY, "timeout": timeout_secs, "memory": 512}
+    try:
+        resp = requests.post(url, json=run_input, params=params, timeout=timeout_secs + 30)
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            if isinstance(data, list): return data
+            if isinstance(data, dict): return data.get("items", data.get("data", []))
+            return []
+        else:
+            db.log_agent_event("scrape",
+                f"Apify {actor_id} HTTP {resp.status_code}: {resp.text[:400]}", level="error")
+            return []
+    except requests.exceptions.Timeout:
+        db.log_agent_event("scrape", f"Apify {actor_id} timed out", level="warn")
+        return []
+    except Exception as e:
+        db.log_agent_event("scrape", f"Apify {actor_id} error: {e}", level="error")
+        return []
 
+def _save_listing(data):
+    ext_id = data.get("external_id", "")
+    title  = data.get("title", "")
+    price  = data.get("price_cad", 0) or 0
+    if not ext_id or not title: return False
+    ok, _ = pre_filter(title, price, data.get("description", ""))
+    if not ok: return False
+    existing = db.get_listing_price(ext_id)
+    if existing:
+        old_price, lid = existing
+        if price and old_price and price < old_price * 0.95:
+            db.update_listing_price(lid, price, old_price)
+            db.log_agent_event("scrape", f"Price drop '{title[:35]}' ${old_price:.0f}→${price:.0f}")
+        return False
+    if db.get_duplicate_check(title, price): return False
+    db.save_listing({
+        "platform":    data["platform"],
+        "external_id": ext_id,
+        "url":         data.get("url", ""),
+        "title":       title,
+        "description": data.get("description", ""),
+        "price_cad":   price,
+        "city":        data.get("city", "toronto"),
+        "images":      data.get("images", []),
+        "image_url":   data.get("image_url", ""),
+        "status":      "new",
+    })
+    return True
+
+# ── KIJIJI ────────────────────────────────────────────────────────────────────
 def run_kijiji_scrape():
-    from playwright.sync_api import sync_playwright
+    """
+    Actor: automation-lab/kijiji-scraper (V5XnYsUNkjXYrFvbc)
+    Schema confirmed from official Apify code sample:
+      startUrls, searchQuery, category, location, maxListings, includeDetails
+    """
+    ACTOR = "V5XnYsUNkjXYrFvbc"   # automation-lab/kijiji-scraper
     total_new = 0
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
-            
-            for s in KIJIJI_SEARCHES:
-                try:
-                    results = []
-                    url = f"https://www.kijiji.ca/b-buy-sell/toronto/{s}/k0c0l1700273"
-                    page = browser.new_page()
-                    
-                    captured = []
-                    def handle_response(response):
-                        if 'api/2.0/ads' in response.url or 'srp-api' in response.url:
-                            try:
-                                data = response.json()
-                                captured.append(data)
-                            except:
-                                pass
-                    
-                    page.on('response', handle_response)
-                    try:
-                        page.goto(url, wait_until='networkidle', timeout=30000)
-                    except Exception as e:
-                        db.log_agent_event("scrape", f"Kijiji load timeout for {s}: {e}", level="warn")
-                    page.wait_for_timeout(3000)
-                    
-                    # Parse captured API responses
-                    for data in captured:
-                        ads = data.get('ads', data.get('data', {}).get('ads', []))
-                        for ad in ads:
-                            try:
-                                results.append({
-                                    'title': ad.get('title', ''),
-                                    'price': float(ad.get('price', {}).get('amount', 0)) / 100.0,
-                                    'url': 'https://www.kijiji.ca' + ad.get('seoUrl', ''),
-                                    'description': ad.get('description', ''),
-                                    'image_url': ad.get('images', [{}])[0].get('uri', '') if ad.get('images') else ''
-                                })
-                            except:
-                                continue
-                    
-                    # Fallback: parse rendered HTML if API not captured
-                    if not results:
-                        html = page.content()
-                        from bs4 import BeautifulSoup
-                        soup = BeautifulSoup(html, 'html.parser')
-                        for card in soup.select('li[data-listing-id], div[data-listing-id], ul[class*="results"] li, div[data-ad-id]'):
-                            title_el = card.select_one('a[class*="title"], h3 a, a[href*="/v-"] h3, a[data-ad-id] > h3')
-                            price_el = card.select_one('[class*="price"], [data-testid="listing-price"]')
-                            img_el = card.select_one('img')
-                            link_el = card.select_one('a[href*="/v-"]') or card.select_one('a[data-ad-id]')
-                            if title_el and link_el:
-                                try:
-                                    price_text = price_el.get_text(strip=True) if price_el else ''
-                                    href = link_el.get('href', '')
-                                    if not href.startswith('http'): href = 'https://www.kijiji.ca' + href
-                                    results.append({
-                                        'title': title_el.get_text(strip=True),
-                                        'price': extract_price(price_text),
-                                        'url': href,
-                                        'description': '',
-                                        'image_url': img_el.get('src', '') if img_el else ''
-                                    })
-                                except:
-                                    continue
-                    
-                    page.close()
+    for search_url in KIJIJI_SEARCH_URLS:
+        slug = search_url.split("/")[-2]
+        db.log_agent_event("scrape", f"Kijiji: '{slug}' limit={SCRAPE_LIMIT}")
 
-                    if not results:
-                        db.log_agent_event("scrape", f"Kijiji '{s}': no cards found via API or HTML", level="warn")
-                        continue
+        items = _apify_run(ACTOR, {
+            "startUrls":      [{"url": search_url}],
+            "searchQuery":    "",       # empty = use URL's built-in search
+            "category":       "",       # empty = use URL's category
+            "location":       "city-of-toronto",
+            "maxListings":    SCRAPE_LIMIT,
+            "includeDetails": True,
+        }, timeout_secs=240)
 
-                    new = 0
-                    for item in results[:40]:
-                        try:
-                            title = item['title']
-                            href = item['url']
-                            price = item['price']
-                            ext_id = f"kijiji_{href.split('/')[-1]}"
-                            
-                            ok, reason = pre_filter(title, price)
-                            if not ok: continue
+        if not items:
+            db.log_agent_event("scrape", f"Kijiji '{slug}': 0 results", level="warn")
+            time.sleep(1)
+            continue
 
-                            existing = db.get_listing_price(ext_id)
-                            if existing:
-                                old_price, lid = existing
-                                if price and old_price and price < old_price * 0.95:
-                                    db.update_listing_price(lid, price, old_price)
-                                    db.log_agent_event("scrape", f"Price drop: '{title[:35]}' ${old_price:.0f}→${price:.0f}")
-                                continue
+        new = 0
+        for item in items:
+            try:
+                url   = item.get("url","") or item.get("adUrl","")
+                title = item.get("title","") or item.get("name","")
+                price = _parse_price(item.get("price") or item.get("priceAmount"))
+                imgs  = item.get("images",[]) or []
+                if imgs and isinstance(imgs[0], dict):
+                    imgs = [i.get("url","") or i.get("src","") for i in imgs]
+                imgs   = [i for i in imgs if i]
+                tail   = url.rstrip("/").split("/")[-1] if url else ""
+                ext_id = f"kijiji_{tail}" if tail else ""
+                if _save_listing({
+                    "platform": "kijiji", "external_id": ext_id, "url": url,
+                    "title": title,
+                    "description": item.get("description","") or item.get("body",""),
+                    "price_cad": price, "city": "toronto",
+                    "images": imgs[:5], "image_url": imgs[0] if imgs else "",
+                }): new += 1
+            except Exception as e:
+                db.log_agent_event("scrape", f"Kijiji parse err: {e}", level="warn")
 
-                            if db.get_duplicate_check(title, price): continue
-
-                            db.save_listing({
-                                'platform': 'kijiji', 'external_id': ext_id, 'url': href,
-                                'title': title, 'description': item['description'], 'price_cad': price,
-                                'city': 'toronto', 'images': [], 'image_url': item['image_url'], 'status': 'new'
-                            })
-                            new += 1
-                        except:
-                            continue
-
-                    total_new += new
-                    db.log_agent_event("scrape", f"Kijiji '{s}': {new} new listings")
-                    time.sleep(2)
-
-                except Exception as e:
-                    db.log_agent_event("scrape", f"Kijiji search error '{s}': {e}", level="error")
-
-            browser.close()
-    except Exception as e:
-        db.log_agent_event("scrape", f"Kijiji Playwright error: {e}", level="error")
+        total_new += new
+        db.log_agent_event("scrape", f"Kijiji '{slug}': {new} new (from {len(items)})")
+        time.sleep(1)
 
     return total_new
 
 # ── CRAIGSLIST ────────────────────────────────────────────────────────────────
-def fetch_cl_detail(url):
-    try:
-        resp = _safe_get(url)
-        soup = BeautifulSoup(resp.text,'html.parser')
-        desc_el = soup.select_one('#postingbody')
-        desc = desc_el.get_text(strip=True)[:800] if desc_el else ""
-        imgs = []
-        for img in soup.select('img.thumb')[:5]:
-            src = img.get('src','')
-            if src and src.startswith('http'): imgs.append(src.replace('50x50','600x450'))
-        return desc, imgs
-    except:
-        return "", []
-
 def run_craigslist_scrape():
+    """
+    Actor: automation-lab/craigslist-scraper
+    Schema confirmed: searchQueries (array), city, category, maxResults, includeDetails
+    """
+    ACTOR = "1b2gJ9AWuxa5WWlOQ"
     total_new = 0
-    for feed_url in CL_RSS:
+
+    db.log_agent_event("scrape", f"CL: {len(CL_KEYWORDS)} keywords, limit={SCRAPE_LIMIT}")
+    items = _apify_run(ACTOR, {
+        "searchQueries":  CL_KEYWORDS,
+        "city":           "toronto",
+        "category":       "for_sale",
+        "maxResults":     SCRAPE_LIMIT,
+        "includeDetails": True,
+    }, timeout_secs=240)
+
+    if not items:
+        db.log_agent_event("scrape", "CL: 0 results (toronto jewelry sparse — normal)", level="warn")
+        return 0
+
+    for item in items:
         try:
-            feed = feedparser.parse(feed_url)
-            if not feed.entries:
-                db.log_agent_event("scrape", f"CL RSS returned empty feed: {feed_url}", level="warn")
-                continue
-            new = 0
-            for entry in feed.entries:
-                try:
-                    raw_id = entry.get('id','') or entry.get('link','')
-                    ext_id = f"cl_{raw_id.split('/')[-1].split('.')[0]}"
-                    if not ext_id or ext_id=='cl_': continue
-                    title = entry.get('title','')
-                    price = extract_price(title)
-                    ok, reason = pre_filter(title, price)
-                    if not ok or db.listing_exists(ext_id): continue
-                    link = entry.get('link','')
-                    desc, imgs = fetch_cl_detail(link)
-                    db.save_listing({'platform':'craigslist','external_id':ext_id,'url':link,
-                        'title':title,'description':desc,'price_cad':price,
-                        'city':'toronto','images':imgs,'status':'new'})
-                    new += 1
-                except: continue
-            total_new += new
-            db.log_agent_event("scrape", f"Craigslist RSS: {new} new listings")
+            url   = item.get("url","") or item.get("link","") or item.get("postUrl","")
+            title = item.get("title","") or item.get("name","")
+            price = _parse_price(item.get("price"))
+            raw_id = url.rstrip("/").split("/")[-1].split(".")[0] if url else ""
+            ext_id = f"cl_{raw_id}" if raw_id else ""
+            imgs = item.get("images",[]) or []
+            if imgs and isinstance(imgs[0], dict):
+                imgs = [i.get("url","") or i.get("src","") for i in imgs]
+            imgs = [i for i in imgs if i]
+            if _save_listing({
+                "platform": "craigslist", "external_id": ext_id, "url": url,
+                "title": title,
+                "description": item.get("description","") or item.get("body",""),
+                "price_cad": price, "city": "toronto",
+                "images": imgs[:5], "image_url": imgs[0] if imgs else "",
+            }): total_new += 1
         except Exception as e:
-            db.log_agent_event("scrape", f"CL RSS error: {e}", level="error")
+            db.log_agent_event("scrape", f"CL parse err: {e}", level="warn")
+
+    db.log_agent_event("scrape", f"CL: {total_new} new (from {len(items)} fetched)")
     return total_new
 
 # ── EBAY CANADA ───────────────────────────────────────────────────────────────
 def run_ebay_scrape():
-    """eBay Canada via Browse API (free, official). Needs EBAY_APP_ID in .env."""
+    """Official eBay Browse API — free, zero Apify cost. Needs EBAY_APP_ID."""
     app_id = os.getenv("EBAY_APP_ID","")
     if not app_id:
-        db.log_agent_event("scrape","eBay skipped — EBAY_APP_ID not set in .env (optional)")
+        db.log_agent_event("scrape", "eBay skipped — EBAY_APP_ID not set (optional)")
         return 0
-
+    import base64
+    KEYWORDS = ["18k gold ring canada", "14k gold chain canada", "22k gold bracelet canada"]
     total_new = 0
-    for keyword in EBAY_KEYWORDS:
+    try:
+        creds = base64.b64encode(
+            f"{app_id}:{os.getenv('EBAY_CLIENT_SECRET','')}".encode()).decode()
+        token = requests.post(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            headers={"Authorization": f"Basic {creds}",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            data="grant_type=client_credentials"
+                 "&scope=https://api.ebay.com/oauth/api_scope/buy.item.summary",
+            timeout=10).json().get("access_token","")
+        if not token: return 0
+    except: return 0
+    for kw in KEYWORDS:
         try:
-            resp = requests.get(
+            items = requests.get(
                 "https://api.ebay.com/buy/browse/v1/item_summary/search",
-                headers={
-                    "Authorization": f"Bearer {_get_ebay_token(app_id)}",
-                    "X-EBAY-C-MARKETPLACE-ID": "EBAY_CA",
-                    "Content-Type": "application/json",
-                },
-                params={
-                    "q": keyword,
-                    "category_ids": "281",  # Jewelry & Watches
-                    "filter": "price:[30..2000],priceCurrency:CAD,itemLocationCountry:CA,conditionIds:{1000|1500|2000|2500}",
-                    "sort": "newlyListed",
-                    "limit": "20",
-                },
-                timeout=15
-            )
-            if resp.status_code != 200:
-                db.log_agent_event("scrape", f"eBay API error: {resp.status_code}", level="warn")
-                continue
-
-            items = resp.json().get("itemSummaries", [])
+                headers={"Authorization": f"Bearer {token}",
+                         "X-EBAY-C-MARKETPLACE-ID": "EBAY_CA"},
+                params={"q": kw, "category_ids": "281",
+                        "filter": "price:[30..2000],priceCurrency:CAD,itemLocationCountry:CA",
+                        "sort": "newlyListed", "limit": str(SCRAPE_LIMIT)},
+                timeout=15).json().get("itemSummaries",[])
             new = 0
             for item in items:
-                try:
-                    ext_id = f"ebay_{item['itemId']}"
-                    if db.listing_exists(ext_id): continue
-                    title = item.get('title','')
-                    price = float(item.get('price',{}).get('value',0))
-                    ok, _ = pre_filter(title, price)
-                    if not ok: continue
-                    imgs = [item['image']['imageUrl']] if item.get('image') else []
-                    db.save_listing({'platform':'ebay','external_id':ext_id,
-                        'url':item.get('itemWebUrl',''),'title':title,'description':'',
-                        'price_cad':price,'city':'canada','images':imgs,'status':'new'})
-                    new += 1
-                except: continue
+                ext_id = f"ebay_{item['itemId']}"
+                price  = float(item.get("price",{}).get("value",0))
+                title  = item.get("title","")
+                ok, _  = pre_filter(title, price)
+                if not ok or db.listing_exists(ext_id): continue
+                imgs = [item["image"]["imageUrl"]] if item.get("image") else []
+                db.save_listing({"platform":"ebay","external_id":ext_id,
+                    "url":item.get("itemWebUrl",""),"title":title,"description":"",
+                    "price_cad":price,"city":"canada",
+                    "images":imgs,"image_url":imgs[0] if imgs else "","status":"new"})
+                new += 1
             total_new += new
-            db.log_agent_event("scrape", f"eBay '{keyword}': {new} new")
-            time.sleep(0.5)
+            db.log_agent_event("scrape", f"eBay '{kw}': {new} new")
         except Exception as e:
-            db.log_agent_event("scrape", f"eBay error '{keyword}': {e}", level="error")
+            db.log_agent_event("scrape", f"eBay '{kw}' error: {e}", level="error")
     return total_new
 
-_ebay_token_cache = {"token": None, "expires": None}
-def _get_ebay_token(app_id):
-    import base64, datetime as dt
-    if _ebay_token_cache["token"] and _ebay_token_cache["expires"] and \
-       dt.datetime.now() < _ebay_token_cache["expires"]:
-        return _ebay_token_cache["token"]
-    client_secret = os.getenv("EBAY_CLIENT_SECRET","")
-    creds = base64.b64encode(f"{app_id}:{client_secret}".encode()).decode()
-    resp = requests.post("https://api.ebay.com/identity/v1/oauth2/token",
-        headers={"Authorization":f"Basic {creds}","Content-Type":"application/x-www-form-urlencoded"},
-        data="grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope/buy.item.summary",
-        timeout=10)
-    token = resp.json().get("access_token","")
-    expires_in = resp.json().get("expires_in", 7200)
-    import datetime as dt2
-    _ebay_token_cache["token"] = token
-    _ebay_token_cache["expires"] = dt2.datetime.now() + dt2.timedelta(seconds=expires_in - 60)
-    return token
-
 # ── FACEBOOK ──────────────────────────────────────────────────────────────────
-async def run_fb_scrape(playwright_ctx, keyword="gold ring"):
-    """FB Marketplace scraping via Browser Use with Gemini. Falls back gracefully."""
-    try:
-        from browser_use import Agent
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("GEMINI_API_KEY"))
-        agent = Agent(
-            task=f"""Go to: https://www.facebook.com/marketplace/toronto/search/?query={keyword.replace(' ','%20')}
-I am already logged in to Facebook. DO NOT try to log in.
-Wait for page to fully load. Scroll down slowly twice.
-Extract up to 20 non-sponsored listings. For each collect:
-  title, price (number in CAD only, no $ sign), url (full Facebook URL), image (thumbnail URL)
-Return ONLY a valid JSON array — no other text, no markdown:
-[{{"title":"...","price":0,"url":"...","image":"..."}}]""",
-            llm=llm, browser_context=playwright_ctx)
-        result = await agent.run(max_steps=20)
-        raw = (result.final_result() or "[]").strip().replace('```json','').replace('```','').strip()
-        # Safety check — scan response for ban signals
-        from safety import check_browser_response_for_bans
-        if check_browser_response_for_bans(raw, "facebook"):
-            return 0
-        items = json.loads(raw)
-        new = 0
-        for item in items:
-            try:
-                item_url = item.get('url','')
-                if not item_url: continue
-                parts = item_url.rstrip('/').split('/')
-                item_id = parts[-1] if parts[-1] else parts[-2]
-                ext_id = f"fb_{item_id}"
-                title = item.get('title','')
-                price = float(item.get('price') or 0)
-                ok, _ = pre_filter(title, price)
-                if not ok or db.listing_exists(ext_id): continue
-                if db.get_duplicate_check(title, price): continue
-                db.save_listing({'platform':'facebook','external_id':ext_id,'url':item_url,
-                    'title':title,'description':'','price_cad':price,'city':'toronto',
-                    'images':[item['image']] if item.get('image') else [],'status':'new'})
-                new += 1
-            except: continue
-        db.log_agent_event("scrape", f"Facebook '{keyword}': {new} new")
-        return new
-    except Exception as e:
-        db.log_agent_event("scrape", f"FB scrape error '{keyword}': {e}", level="error")
-        return 0
-
-async def run_all_fb_scrapes(playwright_ctx):
-    total = 0
-    for kw in FB_KEYWORDS:
-        total += await run_fb_scrape(playwright_ctx, kw)
-        await asyncio.sleep(random.uniform(3,7))
-    return total
-
-import random
+def run_fb_scrape():
+    db.log_agent_event("scrape", "FB skipped — enable after Kijiji/CL confirmed working")
+    return 0
